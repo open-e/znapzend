@@ -39,3 +39,4 @@ dump.dmp
 *.selftest-rewritten
 *~
 conftools
+CLAUDE.md

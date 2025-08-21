@@ -57,6 +57,9 @@ has skipOnPreSendCmdFail    => sub { 0 };
 has cleanOffline            => sub { 0 };
 has 'mailErrorSummaryTo';
 has backupSets              => sub { [] };
+has maxConcurrentJobs       => sub { 4 };
+has activeJobs              => sub { 0 };
+has jobQueue                => sub { [] };
 
 
 has zConfig => sub {
@@ -126,6 +129,10 @@ my $killThemAll = sub {
     $self->zLog->info("terminating znapzend (PID=$$) ...");
     #set termination flag
     $self->terminate(1);
+    
+    # Clear job queue
+    $self->jobQueue([]);
+    $self->activeJobs(0);
 
     Mojo::IOLoop->reset;
 
@@ -143,6 +150,27 @@ my $killThemAll = sub {
 
     $self->zLog->info("znapzend (PID=$$) terminated.");
     exit 0;
+};
+
+my $checkJobQueue = sub {
+    my $self = shift;
+    
+    # Process jobs from queue if we have available slots
+    while ($self->activeJobs < $self->maxConcurrentJobs && @{$self->jobQueue}) {
+        my $job = shift @{$self->jobQueue};
+        
+        $self->zLog->debug("dequeuing job for $job->{backupSet}->{src} (type: $job->{type})");
+        
+        # Increment active jobs counter
+        $self->activeJobs($self->activeJobs + 1);
+        
+        # Execute the job
+        if ($job->{type} eq 'snapshot') {
+            $job->{callback}->($job->{backupSet}, $job->{timeStamp});
+        } elsif ($job->{type} eq 'send') {
+            $job->{callback}->($job->{backupSet}, $job->{timeStamp});
+        }
+    }
 };
 
 # Return an array of dataset names which are local descendants of the
@@ -1391,7 +1419,7 @@ my $createSnapshot = sub {
     return 1;
 };
 
-my $sendWorker = sub {
+my $sendWorkerActual = sub {
     my $self = shift;
     my $backupSet = shift;
     my $timeStamp = shift;
@@ -1418,6 +1446,10 @@ my $sendWorker = sub {
                 . " done ($backupSet->{send_pid})");
             #send/receive process finished, clear pid from backup set
             $backupSet->{send_pid} = 0;
+            
+            # Decrement active jobs counter and process queue
+            $self->activeJobs($self->activeJobs - 1);
+            $self->$checkJobQueue();
         }
     );
 
@@ -1443,7 +1475,31 @@ my $sendWorker = sub {
     );
 };
 
-my $snapWorker = sub {
+my $sendWorker = sub {
+    my $self = shift;
+    my $backupSet = shift;
+    my $timeStamp = shift;
+    
+    # Check if we can execute now or need to queue
+    if ($self->activeJobs >= $self->maxConcurrentJobs) {
+        # Queue the job
+        push @{$self->jobQueue}, {
+            type => 'send',
+            backupSet => $backupSet,
+            timeStamp => $timeStamp,
+            callback => $sendWorkerActual
+        };
+        $self->zLog->debug("queuing send job for $backupSet->{src} (active: ${\($self->activeJobs)}, max: ${\($self->maxConcurrentJobs)})");
+        return;
+    }
+    
+    # Increment active jobs counter and execute immediately
+    $self->activeJobs($self->activeJobs + 1);
+    $self->zLog->debug("executing send job for $backupSet->{src} (active: ${\($self->activeJobs)}, max: ${\($self->maxConcurrentJobs)})");
+    $self->$sendWorkerActual($backupSet, $timeStamp);
+};
+
+my $snapWorkerActual = sub {
     my $self = shift;
     my $backupSet = shift;
     my $timeStamp = shift;
@@ -1471,6 +1527,10 @@ my $snapWorker = sub {
                 . " done ($backupSet->{snap_pid})");
             #snapshot process finished, clear pid from backup set
             $backupSet->{snap_pid} = 0;
+            
+            # Decrement active jobs counter and process queue
+            $self->activeJobs($self->activeJobs - 1);
+            $self->$checkJobQueue();
 
             if ($backupSet->{send_pid}){
                 $self->zLog->info('previous send/receive process on ' . $backupSet->{src}
@@ -1502,6 +1562,30 @@ my $snapWorker = sub {
             $self->zLog->warn($err) if !$self->terminate;
         }
     );
+};
+
+my $snapWorker = sub {
+    my $self = shift;
+    my $backupSet = shift;
+    my $timeStamp = shift;
+    
+    # Check if we can execute now or need to queue
+    if ($self->activeJobs >= $self->maxConcurrentJobs) {
+        # Queue the job
+        push @{$self->jobQueue}, {
+            type => 'snapshot',
+            backupSet => $backupSet,
+            timeStamp => $timeStamp,
+            callback => $snapWorkerActual
+        };
+        $self->zLog->debug("queuing snapshot job for $backupSet->{src} (active: ${\($self->activeJobs)}, max: ${\($self->maxConcurrentJobs)})");
+        return;
+    }
+    
+    # Increment active jobs counter and execute immediately
+    $self->activeJobs($self->activeJobs + 1);
+    $self->zLog->debug("executing snapshot job for $backupSet->{src} (active: ${\($self->activeJobs)}, max: ${\($self->maxConcurrentJobs)})");
+    $self->$snapWorkerActual($backupSet, $timeStamp);
 };
 
 my $createWorkers = sub {

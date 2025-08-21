@@ -24,7 +24,7 @@ sub main {
             # for "zfs send", so the longer variants --skipIntermediates
             # vs. --sendIntermediates are not documented in the manpage.
         qw(skipOnPreSnapCmdFail skipOnPreSendCmdFail recursive|r inherited since=s sinceForced=s),
-        qw(cleanOffline mailErrorSummaryTo=s)
+        qw(cleanOffline mailErrorSummaryTo=s maxConcurrentJobs=i)
         ) or exit 1;
 
     $opts->{version} && do {
@@ -148,6 +148,12 @@ sub main {
         $opts->{zfsGetType} = 0;
     }
 
+    if (!defined($opts->{maxConcurrentJobs})) {
+        $opts->{maxConcurrentJobs} = 4;
+    } elsif ($opts->{maxConcurrentJobs} < 1) {
+        die "ERROR: --max-concurrent-jobs must be at least 1\n";
+    }
+
     $opts->{help} && do {
         pod2usage(-exitval => 'NOEXIT');
 
@@ -222,6 +228,7 @@ B<znapzend> [I<options>...]
  --skipOnPreSendCmdFail skip replication if the pre-send-command fails
  --cleanOffline         clean up source snapshots even if a destination was offline
  --mailErrorSummaryTo=rcpt  if "send task(s) failed", mail a summary to rcpt
+ --maxConcurrentJobs=x  maximum number of concurrent snapshot/send jobs (default: 4)
 
 =head1 DESCRIPTION
 
@@ -670,6 +677,14 @@ system setup to validate the recipient names (local or domain-suffixed) and
 deliver the message to some mailbox.
 
 This feature relies on a program which supports standard sendmail-like CLI.
+
+=item B<--maxConcurrentJobs=N>
+
+Limit the maximum number of concurrent snapshot and send/receive jobs. When this 
+limit is reached, additional jobs are queued and processed when slots become 
+available. This helps prevent system overload on hosts with many datasets.
+
+Default value is 4. Must be at least 1.
 
 =back
 
